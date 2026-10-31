@@ -1,0 +1,1212 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <string.h>
+
+// =====================================================
+// LCD
+// =====================================================
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// =====================================================
+// APPROACH INDEX
+// =====================================================
+
+const byte NORTH = 0;
+const byte SOUTH = 1;
+const byte EAST  = 2;
+const byte WEST  = 3;
+
+const byte NUM_LANES = 4;
+
+const char* laneName[NUM_LANES] = {
+  "NORTH",
+  "SOUTH",
+  "EAST",
+  "WEST"
+};
+
+const char laneLetter[NUM_LANES] = {
+  'N',
+  'S',
+  'E',
+  'W'
+};
+
+// =====================================================
+// 12 IR SENSOR PINS
+//
+// Each direction has 3 IR sensors.
+//
+// Sensor order DOES NOT matter for density.
+//
+// Any 1 sensor = LOW
+// Any 2 sensors = MEDIUM
+// All 3 sensors = HIGH
+// =====================================================
+
+const byte sensorPins[NUM_LANES][3] = {
+
+  {22, 23, 24},   // NORTH
+  {25, 26, 27},   // SOUTH
+  {28, 29, 30},   // EAST
+  {31, 32, 33}    // WEST
+};
+
+// =====================================================
+// 12 TRAFFIC LIGHT LED PINS
+//
+// Column 0 = RED
+// Column 1 = YELLOW
+// Column 2 = GREEN
+// =====================================================
+
+const byte ledPins[NUM_LANES][3] = {
+
+  {34, 35, 36},   // NORTH
+  {37, 38, 39},   // SOUTH
+  {40, 41, 42},   // EAST
+  {43, 44, 45}    // WEST
+};
+
+// =====================================================
+// SENSOR CONFIGURATION
+// =====================================================
+
+// Your tested IR sensors:
+// LOW = object detected
+const bool SENSOR_ACTIVE_LOW = true;
+
+// =====================================================
+// TRAFFIC TIMINGS
+// =====================================================
+
+const unsigned long LOW_GREEN_TIME  = 7000UL;
+const unsigned long MED_GREEN_TIME  = 10000UL;
+const unsigned long HIGH_GREEN_TIME = 15000UL;
+
+const unsigned long YELLOW_TIME  = 3000UL;
+const unsigned long ALL_RED_TIME = 1000UL;
+
+// =====================================================
+// SENSOR DATA
+// =====================================================
+
+bool sensorState[NUM_LANES][3] = {
+
+  {false, false, false},
+  {false, false, false},
+  {false, false, false},
+  {false, false, false}
+};
+
+// Density:
+//
+// 0 = EMPTY
+// 1 = LOW
+// 2 = MEDIUM
+// 3 = HIGH
+//
+int density[NUM_LANES] = {
+  0, 0, 0, 0
+};
+
+// Density captured at beginning of service cycle
+int cycleDensity[NUM_LANES] = {
+  0, 0, 0, 0
+};
+
+// Tracks whether lane already received a turn
+bool served[NUM_LANES] = {
+  false, false, false, false
+};
+
+// =====================================================
+// TRAFFIC STATE MACHINE
+// =====================================================
+
+enum TrafficState {
+
+  WAITING,
+  GREEN_STATE,
+  YELLOW_STATE,
+  ALL_RED_STATE
+};
+
+TrafficState currentState = WAITING;
+
+int activeLane = -1;
+
+// Start as WEST previously served.
+//
+// Therefore first equal tie begins:
+// NORTH → SOUTH → EAST → WEST
+int lastServed = WEST;
+
+unsigned long stateStartTime = 0;
+unsigned long stateDuration  = 0;
+
+// =====================================================
+// LCD PAGE SYSTEM
+// =====================================================
+
+byte lcdPage = 0;
+
+unsigned long previousLCDPageTime = 0;
+
+const unsigned long LCD_PAGE_TIME = 2500UL;
+
+// =====================================================
+// FUNCTION DECLARATIONS
+// =====================================================
+
+bool readStableSensor(byte pin);
+
+void readAllSensors();
+
+int calculateLaneDensity(int lane);
+
+void calculateAllDensities();
+
+void startNewCycle();
+
+int chooseNextLane();
+
+unsigned long getGreenTime(int d);
+
+void startGreen(int lane);
+
+void startYellow();
+
+void startAllRed();
+
+void trafficController();
+
+void allRed();
+
+void setGreen(int lane);
+
+void setYellow(int lane);
+
+char densityCharacter(int d);
+
+const char* densityName(int d);
+
+void printLCDLine(byte row, const char* text);
+
+void updateLCD();
+
+void printSerial();
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+
+  Serial.begin(9600);
+
+  // ---------------------------------------------------
+  // Configure all IR sensors
+  // ---------------------------------------------------
+
+  for (int lane = 0; lane < NUM_LANES; lane++) {
+
+    for (int sensor = 0; sensor < 3; sensor++) {
+
+      pinMode(
+        sensorPins[lane][sensor],
+        INPUT
+      );
+    }
+  }
+
+  // ---------------------------------------------------
+  // Configure all traffic LEDs
+  // ---------------------------------------------------
+
+  for (int lane = 0; lane < NUM_LANES; lane++) {
+
+    for (int light = 0; light < 3; light++) {
+
+      pinMode(
+        ledPins[lane][light],
+        OUTPUT
+      );
+    }
+  }
+
+  // Start in safe condition
+  allRed();
+
+  // ---------------------------------------------------
+  // LCD
+  // ---------------------------------------------------
+
+  lcd.init();
+  lcd.backlight();
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("4-WAY TRAFFIC");
+
+  lcd.setCursor(0, 1);
+  lcd.print("INITIALIZING...");
+
+  // ---------------------------------------------------
+  // SERIAL
+  // ---------------------------------------------------
+
+  Serial.println();
+  Serial.println("======================================");
+  Serial.println(" DENSITY BASED TRAFFIC CONTROL SYSTEM");
+  Serial.println("======================================");
+  Serial.println();
+
+  delay(1500);
+
+  lcd.clear();
+}
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
+
+void loop() {
+
+  // Read all 12 IR sensors
+  readAllSensors();
+
+  // Calculate density of N/S/E/W
+  calculateAllDensities();
+
+  // Run traffic control algorithm
+  trafficController();
+
+  // Update LCD
+  updateLCD();
+
+  // Debug output
+  printSerial();
+}
+
+// =====================================================
+// STABLE IR SENSOR READING
+//
+// Takes 7 readings.
+//
+// At least 4 must agree before sensor is considered
+// occupied.
+// =====================================================
+
+bool readStableSensor(byte pin) {
+
+  int detectedCount = 0;
+
+  for (int sample = 0; sample < 7; sample++) {
+
+    int rawValue = digitalRead(pin);
+
+    bool detected;
+
+    if (SENSOR_ACTIVE_LOW) {
+
+      detected = (rawValue == LOW);
+    }
+
+    else {
+
+      detected = (rawValue == HIGH);
+    }
+
+    if (detected) {
+
+      detectedCount++;
+    }
+
+    delay(2);
+  }
+
+  return detectedCount >= 4;
+}
+
+// =====================================================
+// READ ALL 12 IR SENSORS
+// =====================================================
+
+void readAllSensors() {
+
+  for (int lane = 0; lane < NUM_LANES; lane++) {
+
+    for (int sensor = 0; sensor < 3; sensor++) {
+
+      sensorState[lane][sensor] =
+        readStableSensor(
+          sensorPins[lane][sensor]
+        );
+    }
+  }
+}
+
+// =====================================================
+// CALCULATE DENSITY
+//
+// IMPORTANT:
+//
+// Sensor position/order DOES NOT matter.
+//
+// 000 = EMPTY
+//
+// Any one sensor:
+// 100 / 010 / 001 = LOW
+//
+// Any two sensors:
+// 110 / 101 / 011 = MEDIUM
+//
+// 111 = HIGH
+// =====================================================
+
+int calculateLaneDensity(int lane) {
+
+  int activeSensors = 0;
+
+  for (int sensor = 0; sensor < 3; sensor++) {
+
+    if (sensorState[lane][sensor]) {
+
+      activeSensors++;
+    }
+  }
+
+  // 0, 1, 2 or 3
+  return activeSensors;
+}
+
+// =====================================================
+// CALCULATE ALL FOUR ROAD DENSITIES
+// =====================================================
+
+void calculateAllDensities() {
+
+  for (int lane = 0; lane < NUM_LANES; lane++) {
+
+    density[lane] =
+      calculateLaneDensity(lane);
+  }
+}
+
+// =====================================================
+// START A NEW SERVICE CYCLE
+//
+// Current traffic density is copied.
+//
+// Every occupied direction receives one turn before
+// starting another complete scan.
+// =====================================================
+
+void startNewCycle() {
+
+  for (int lane = 0; lane < NUM_LANES; lane++) {
+
+    served[lane] = false;
+
+    if (density[lane] >= 1 &&
+        density[lane] <= 3) {
+
+      cycleDensity[lane] =
+        density[lane];
+    }
+
+    else {
+
+      cycleDensity[lane] = 0;
+    }
+  }
+}
+
+// =====================================================
+// CHOOSE NEXT ROAD
+//
+// Priority:
+//
+// HIGH   first
+// MEDIUM second
+// LOW    third
+//
+// If equal density:
+// rotating priority is used.
+//
+// Already served road cannot repeat in same cycle.
+// =====================================================
+
+int chooseNextLane() {
+
+  int highestDensity = 0;
+
+  // ---------------------------------------------------
+  // Find highest unserved density
+  // ---------------------------------------------------
+
+  for (int lane = 0; lane < NUM_LANES; lane++) {
+
+    if (!served[lane] &&
+        cycleDensity[lane] > highestDensity) {
+
+      highestDensity =
+        cycleDensity[lane];
+    }
+  }
+
+  // No remaining traffic
+  if (highestDensity == 0) {
+
+    return -1;
+  }
+
+  // ---------------------------------------------------
+  // Fair rotating priority
+  // ---------------------------------------------------
+
+  for (int offset = 1;
+       offset <= NUM_LANES;
+       offset++) {
+
+    int lane =
+      (lastServed + offset) % NUM_LANES;
+
+    if (!served[lane] &&
+        cycleDensity[lane] == highestDensity) {
+
+      return lane;
+    }
+  }
+
+  return -1;
+}
+
+// =====================================================
+// GREEN TIME ACCORDING TO DENSITY
+// =====================================================
+
+unsigned long getGreenTime(int d) {
+
+  switch (d) {
+
+    case 1:
+      return LOW_GREEN_TIME;
+
+    case 2:
+      return MED_GREEN_TIME;
+
+    case 3:
+      return HIGH_GREEN_TIME;
+
+    default:
+      return 0;
+  }
+}
+
+// =====================================================
+// START GREEN SIGNAL
+// =====================================================
+
+void startGreen(int lane) {
+
+  activeLane = lane;
+
+  stateDuration =
+    getGreenTime(
+      cycleDensity[lane]
+    );
+
+  stateStartTime =
+    millis();
+
+  setGreen(lane);
+
+  currentState =
+    GREEN_STATE;
+
+  Serial.println();
+
+  Serial.print(
+    laneName[lane]
+  );
+
+  Serial.print(
+    " -> GREEN | Density = "
+  );
+
+  Serial.print(
+    densityName(
+      cycleDensity[lane]
+    )
+  );
+
+  Serial.print(
+    " | Green Time = "
+  );
+
+  Serial.print(
+    stateDuration / 1000
+  );
+
+  Serial.println(
+    " seconds"
+  );
+}
+
+// =====================================================
+// START YELLOW SIGNAL
+// =====================================================
+
+void startYellow() {
+
+  setYellow(
+    activeLane
+  );
+
+  stateStartTime =
+    millis();
+
+  stateDuration =
+    YELLOW_TIME;
+
+  currentState =
+    YELLOW_STATE;
+
+  Serial.print(
+    laneName[activeLane]
+  );
+
+  Serial.println(
+    " -> YELLOW"
+  );
+}
+
+// =====================================================
+// START ALL RED SAFETY GAP
+// =====================================================
+
+void startAllRed() {
+
+  allRed();
+
+  stateStartTime =
+    millis();
+
+  stateDuration =
+    ALL_RED_TIME;
+
+  currentState =
+    ALL_RED_STATE;
+
+  Serial.println(
+    "ALL RED -> SAFETY GAP"
+  );
+}
+
+// =====================================================
+// MAIN TRAFFIC CONTROLLER
+// =====================================================
+
+void trafficController() {
+
+  unsigned long now =
+    millis();
+
+  // ===================================================
+  // WAITING / NEW TRAFFIC SCAN
+  // ===================================================
+
+  if (currentState == WAITING) {
+
+    allRed();
+
+    // Capture current traffic density
+    startNewCycle();
+
+    int nextLane =
+      chooseNextLane();
+
+    // Traffic exists
+    if (nextLane >= 0) {
+
+      startGreen(
+        nextLane
+      );
+    }
+
+    return;
+  }
+
+  // ===================================================
+  // GREEN
+  // ===================================================
+
+  if (currentState == GREEN_STATE) {
+
+    if (now - stateStartTime >=
+        stateDuration) {
+
+      startYellow();
+    }
+
+    return;
+  }
+
+  // ===================================================
+  // YELLOW
+  // ===================================================
+
+  if (currentState == YELLOW_STATE) {
+
+    if (now - stateStartTime >=
+        stateDuration) {
+
+      startAllRed();
+    }
+
+    return;
+  }
+
+  // ===================================================
+  // ALL RED
+  // ===================================================
+
+  if (currentState == ALL_RED_STATE) {
+
+    if (now - stateStartTime >=
+        stateDuration) {
+
+      // Current direction completed its turn
+
+      served[activeLane] =
+        true;
+
+      lastServed =
+        activeLane;
+
+      // Find next eligible road from same service cycle
+
+      int nextLane =
+        chooseNextLane();
+
+      if (nextLane >= 0) {
+
+        startGreen(
+          nextLane
+        );
+      }
+
+      else {
+
+        // Entire cycle finished.
+        // Next loop performs fresh scan.
+
+        activeLane = -1;
+
+        currentState =
+          WAITING;
+      }
+    }
+  }
+}
+
+// =====================================================
+// ALL FOUR SIGNALS RED
+// =====================================================
+
+void allRed() {
+
+  for (int lane = 0;
+       lane < NUM_LANES;
+       lane++) {
+
+    // RED ON
+    digitalWrite(
+      ledPins[lane][0],
+      HIGH
+    );
+
+    // YELLOW OFF
+    digitalWrite(
+      ledPins[lane][1],
+      LOW
+    );
+
+    // GREEN OFF
+    digitalWrite(
+      ledPins[lane][2],
+      LOW
+    );
+  }
+}
+
+// =====================================================
+// ONE ROAD GREEN
+//
+// All other roads stay RED.
+// =====================================================
+
+void setGreen(int lane) {
+
+  // Safety:
+  // first make every road RED
+  allRed();
+
+  // Active road RED OFF
+  digitalWrite(
+    ledPins[lane][0],
+    LOW
+  );
+
+  // Active road GREEN ON
+  digitalWrite(
+    ledPins[lane][2],
+    HIGH
+  );
+}
+
+// =====================================================
+// ONE ROAD YELLOW
+//
+// All other roads stay RED.
+// =====================================================
+
+void setYellow(int lane) {
+
+  allRed();
+
+  // Active RED OFF
+  digitalWrite(
+    ledPins[lane][0],
+    LOW
+  );
+
+  // Active YELLOW ON
+  digitalWrite(
+    ledPins[lane][1],
+    HIGH
+  );
+}
+
+// =====================================================
+// SHORT DENSITY CHARACTER
+// =====================================================
+
+char densityCharacter(int d) {
+
+  switch (d) {
+
+    case 0:
+      return '0';
+
+    case 1:
+      return 'L';
+
+    case 2:
+      return 'M';
+
+    case 3:
+      return 'H';
+
+    default:
+      return '?';
+  }
+}
+
+// =====================================================
+// DENSITY TEXT
+// =====================================================
+
+const char* densityName(int d) {
+
+  switch (d) {
+
+    case 0:
+      return "EMPTY";
+
+    case 1:
+      return "LOW";
+
+    case 2:
+      return "MED";
+
+    case 3:
+      return "HIGH";
+
+    default:
+      return "UNKNOWN";
+  }
+}
+
+// =====================================================
+// CLEAN LCD LINE
+//
+// Always writes exactly 16 positions so previous
+// characters don't remain on screen.
+// =====================================================
+
+void printLCDLine(
+  byte row,
+  const char* text
+) {
+
+  lcd.setCursor(
+    0,
+    row
+  );
+
+  int length =
+    strlen(text);
+
+  for (int i = 0;
+       i < 16;
+       i++) {
+
+    if (i < length) {
+
+      lcd.print(
+        text[i]
+      );
+    }
+
+    else {
+
+      lcd.print(' ');
+    }
+  }
+}
+
+// =====================================================
+// LCD DISPLAY
+//
+// PAGE 0
+// N:H S:M E:L W:0
+// N GREEN 15s
+//
+// PAGE 1
+// N:101 MED
+// S:001 LOW
+//
+// PAGE 2
+// E:110 MED
+// W:111 HIGH
+// =====================================================
+
+void updateLCD() {
+
+  static unsigned long previousUpdate = 0;
+
+  unsigned long now =
+    millis();
+
+  // LCD refresh every 200ms
+  if (now - previousUpdate < 200UL) {
+
+    return;
+  }
+
+  previousUpdate = now;
+
+  // ---------------------------------------------------
+  // Change LCD page every 2.5 seconds
+  // ---------------------------------------------------
+
+  if (now - previousLCDPageTime >=
+      LCD_PAGE_TIME) {
+
+    previousLCDPageTime = now;
+
+    lcdPage++;
+
+    if (lcdPage > 2) {
+
+      lcdPage = 0;
+    }
+  }
+
+  char line1[17];
+  char line2[17];
+
+  // ---------------------------------------------------
+  // Calculate remaining signal time
+  // ---------------------------------------------------
+
+  unsigned long remaining = 0;
+
+  if (currentState != WAITING) {
+
+    unsigned long elapsed =
+      now - stateStartTime;
+
+    if (elapsed < stateDuration) {
+
+      remaining =
+        (
+          stateDuration -
+          elapsed +
+          999UL
+        ) / 1000UL;
+    }
+  }
+
+  // ===================================================
+  // PAGE 0
+  //
+  // OVERALL DENSITY + CURRENT SIGNAL
+  // ===================================================
+
+  if (lcdPage == 0) {
+
+    snprintf(
+      line1,
+      sizeof(line1),
+
+      "N:%c S:%c E:%c W:%c",
+
+      densityCharacter(
+        density[NORTH]
+      ),
+
+      densityCharacter(
+        density[SOUTH]
+      ),
+
+      densityCharacter(
+        density[EAST]
+      ),
+
+      densityCharacter(
+        density[WEST]
+      )
+    );
+
+    // -------------------------------------------------
+    // GREEN
+    // -------------------------------------------------
+
+    if (currentState == GREEN_STATE) {
+
+      snprintf(
+        line2,
+        sizeof(line2),
+
+        "%c GREEN %lus",
+
+        laneLetter[
+          activeLane
+        ],
+
+        remaining
+      );
+    }
+
+    // -------------------------------------------------
+    // YELLOW
+    // -------------------------------------------------
+
+    else if (currentState == YELLOW_STATE) {
+
+      snprintf(
+        line2,
+        sizeof(line2),
+
+        "%c YELLOW %lus",
+
+        laneLetter[
+          activeLane
+        ],
+
+        remaining
+      );
+    }
+
+    // -------------------------------------------------
+    // ALL RED
+    // -------------------------------------------------
+
+    else if (currentState == ALL_RED_STATE) {
+
+      snprintf(
+        line2,
+        sizeof(line2),
+
+        "ALL RED %lus",
+
+        remaining
+      );
+    }
+
+    // -------------------------------------------------
+    // WAITING
+    // -------------------------------------------------
+
+    else {
+
+      snprintf(
+        line2,
+        sizeof(line2),
+
+        "ALL RED-WAITING"
+      );
+    }
+  }
+
+  // ===================================================
+  // PAGE 1
+  //
+  // NORTH + SOUTH SENSOR DETAILS
+  // ===================================================
+
+  else if (lcdPage == 1) {
+
+    snprintf(
+      line1,
+      sizeof(line1),
+
+      "N:%d%d%d %s",
+
+      sensorState[NORTH][0] ? 1 : 0,
+      sensorState[NORTH][1] ? 1 : 0,
+      sensorState[NORTH][2] ? 1 : 0,
+
+      densityName(
+        density[NORTH]
+      )
+    );
+
+    snprintf(
+      line2,
+      sizeof(line2),
+
+      "S:%d%d%d %s",
+
+      sensorState[SOUTH][0] ? 1 : 0,
+      sensorState[SOUTH][1] ? 1 : 0,
+      sensorState[SOUTH][2] ? 1 : 0,
+
+      densityName(
+        density[SOUTH]
+      )
+    );
+  }
+
+  // ===================================================
+  // PAGE 2
+  //
+  // EAST + WEST SENSOR DETAILS
+  // ===================================================
+
+  else {
+
+    snprintf(
+      line1,
+      sizeof(line1),
+
+      "E:%d%d%d %s",
+
+      sensorState[EAST][0] ? 1 : 0,
+      sensorState[EAST][1] ? 1 : 0,
+      sensorState[EAST][2] ? 1 : 0,
+
+      densityName(
+        density[EAST]
+      )
+    );
+
+    snprintf(
+      line2,
+      sizeof(line2),
+
+      "W:%d%d%d %s",
+
+      sensorState[WEST][0] ? 1 : 0,
+      sensorState[WEST][1] ? 1 : 0,
+      sensorState[WEST][2] ? 1 : 0,
+
+      densityName(
+        density[WEST]
+      )
+    );
+  }
+
+  printLCDLine(
+    0,
+    line1
+  );
+
+  printLCDLine(
+    1,
+    line2
+  );
+}
+
+// =====================================================
+// SERIAL MONITOR
+// =====================================================
+
+void printSerial() {
+
+  static unsigned long previousPrint = 0;
+
+  if (millis() -
+      previousPrint <
+      500UL) {
+
+    return;
+  }
+
+  previousPrint =
+    millis();
+
+  Serial.println(
+    "--------------------------------"
+  );
+
+  for (int lane = 0;
+       lane < NUM_LANES;
+       lane++) {
+
+    Serial.print(
+      laneName[lane]
+    );
+
+    Serial.print(
+      " = "
+    );
+
+    // Raw 3-sensor state
+    Serial.print(
+      sensorState[lane][0] ? 1 : 0
+    );
+
+    Serial.print(
+      sensorState[lane][1] ? 1 : 0
+    );
+
+    Serial.print(
+      sensorState[lane][2] ? 1 : 0
+    );
+
+    Serial.print(
+      " | Active Sensors = "
+    );
+
+    Serial.print(
+      density[lane]
+    );
+
+    Serial.print(
+      " | Density = "
+    );
+
+    Serial.println(
+      densityName(
+        density[lane]
+      )
+    );
+  }
+}
