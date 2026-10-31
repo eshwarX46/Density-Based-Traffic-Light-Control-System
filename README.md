@@ -33,7 +33,8 @@ The system also provides live traffic information through a **16×2 I²C LCD dis
 Add your final project image here:
 
 ```html
-<img width="100%" alt="Density Based Traffic Light Control System" src="YOUR_GITHUB_IMAGE_LINK" />
+![Uploading image 1.jpg…]()
+
 ```
 
 ---
